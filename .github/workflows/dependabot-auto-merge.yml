@@ -1,0 +1,188 @@
+# 再利用可能ワークフロー：DependabotのPRを、パッチ・マイナー更新なら自動でマージする。メジャー更新はマージしない。
+# 呼び出し方は README.md と examples/dependabot-auto-merge-caller.yml を参照する。
+#
+# 呼び出し側は、試験のジョブの後（needs）にこのワークフローを呼ぶ。試験が通ったPRだけがマージされる。
+# マージ後のデプロイの起動は、呼び出し側が行う（必要な actions: write を、デプロイしないリポジトリに渡さないため）。
+# このワークフローは、デプロイが要るかどうかを outputs.deploy で返す。
+#
+# 注意：GITHUB_TOKENでのマージは、push・pull_request_target などの別のworkflowを起動しない。
+# mainへのpushで動くデプロイや release-tag.yml は、自動マージでは動かない。
+name: dependabot-auto-merge
+
+on:
+  workflow_call:
+    inputs:
+      merge-method:
+        description: マージの方法（merge・squash・rebase）。
+        type: string
+        default: merge
+      deploy-paths:
+        description: >-
+          デプロイが要る変更ファイルのパス（grep -E の正規表現。例：'^(vod_bot|utils)/'）。
+          空なら、マージしたら常に outputs.deploy を true にする。
+        type: string
+        default: ''
+    outputs:
+      merged:
+        description: このPRをマージしたら 'true'。
+        value: ${{ jobs.merge.outputs.merged }}
+      deploy:
+        description: マージし、かつ deploy-paths に当たる変更を含むなら 'true'。
+        value: ${{ jobs.merge.outputs.deploy }}
+
+permissions:
+  contents: read
+
+jobs:
+  merge:
+    # DependabotのPRのときだけ動く（pushなど、PR以外のイベントでも呼ばれうるため、イベント名も見る）。
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.user.login == 'dependabot[bot]'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    # 呼び出し側の上限を超えない。マージとブランチの削除に、この2つが要る。
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      merged: ${{ steps.merge.outputs.merged }}
+      deploy: ${{ steps.result.outputs.deploy }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      PR_URL: ${{ github.event.pull_request.html_url }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      # 試験した後に別のコミットが積まれていたら、マージしない（試験していないコードを入れない）。
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      HEAD_REF: ${{ github.event.pull_request.head.ref }}
+      MERGE_METHOD: ${{ inputs.merge-method }}
+      DEPLOY_PATHS: ${{ inputs.deploy-paths }}
+    steps:
+      # タグの付け替えで実行内容が変わらないよう、ActionをコミットSHAで固定する。
+      # コミットがDependabotのものかも、このActionが確かめる（偽装したPRでは失敗する）。
+      - name: Dependabot のメタデータを取得
+        id: meta
+        uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
+        with:
+          github-token: ${{ github.token }}
+
+      # マージの前に、デプロイが要るかを決める。正規表現の誤りや変更ファイルの取得失敗は、マージする前に失敗させる
+      # （マージだけが確定して、デプロイの判定が失敗した状態にしない）。
+      - name: デプロイが要るか判定（マージ前）
+        id: scope
+        env:
+          UPDATE_TYPE: ${{ steps.meta.outputs.update-type }}
+        run: |
+          set -euo pipefail
+          case "$MERGE_METHOD" in
+            merge|squash|rebase) ;;
+            *)
+              echo "::error::merge-method は merge・squash・rebase のどれかにしてください（いま：${MERGE_METHOD}）。"
+              exit 1
+              ;;
+          esac
+          # マージしない更新（メジャー・不明）では、変更ファイルを調べない。
+          case "$UPDATE_TYPE" in
+            version-update:semver-patch|version-update:semver-minor) ;;
+            *)
+              echo "match=false" >> "$GITHUB_OUTPUT"
+              exit 0
+              ;;
+          esac
+          # 対象のパスの指定がなければ、マージしたら常にデプロイする。
+          if [ -z "$DEPLOY_PATHS" ]; then
+            echo "match=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # grep -E の終了コード：0＝一致あり、1＝一致なし、2以上＝正規表現の誤りなど。
+          # 空の入力で正規表現だけを検証する（誤りなら2）。
+          status=0
+          grep -qE -- "$DEPLOY_PATHS" < /dev/null || status=$?
+          if [ "$status" -gt 1 ]; then
+            echo "::error::deploy-paths の正規表現が不正です: ${DEPLOY_PATHS}"
+            exit 1
+          fi
+          files=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}/files" --paginate --jq '.[].filename')
+          printf '%s\n' "$files"
+          # ヒアストリングで渡す。パイプにすると、grep -q が先に終わったときに、書き込み側がSIGPIPEで失敗する。
+          status=0
+          grep -qE -- "$DEPLOY_PATHS" <<< "$files" || status=$?
+          case "$status" in
+            0) echo "match=true" >> "$GITHUB_OUTPUT" ;;
+            1) echo "match=false" >> "$GITHUB_OUTPUT" ;;
+            *)
+              echo "::error::deploy-paths の判定に失敗しました（終了コード ${status}）。"
+              exit 1
+              ;;
+          esac
+
+      - name: パッチ・マイナー更新ならマージ
+        id: merge
+        env:
+          UPDATE_TYPE: ${{ steps.meta.outputs.update-type }}
+        run: |
+          set -euo pipefail
+          # 種類が分からない更新（空）も、メジャー更新と同じく人が確かめる。明示的にパッチ・マイナーのものだけをマージする。
+          case "$UPDATE_TYPE" in
+            version-update:semver-patch|version-update:semver-minor)
+              # 再実行したときのイベントは、最初の実行のときの内容のまま。いまの状態を確かめ、すでにマージ済み・閉じ済みなら、
+              # 今回のマージとして扱わない（gh pr merge は、マージ済みでも成功で返るため）。
+              state=$(gh pr view "$PR_URL" --json state --jq .state)
+              if [ "$state" != "OPEN" ]; then
+                echo "merged=false" >> "$GITHUB_OUTPUT"
+                echo "### このPRはすでに ${state} のため、何もしませんでした（デプロイが要るときは、呼び出し側のデプロイを手動で起動してください）" >> "$GITHUB_STEP_SUMMARY"
+                exit 0
+              fi
+              # マージは REST API で行い、応答の merged で、今回このリクエストがマージしたかを確かめる
+              # （gh pr merge は、直前に別の操作でマージされていても成功で返るため、今回の操作と区別できない）。
+              # sha を渡すので、試験した後に別のコミットが積まれていたら409で失敗する（--match-head-commit と同じ）。
+              if out=$(gh api -X PUT "repos/${REPO}/pulls/${PR_NUMBER}/merge" -f "sha=${HEAD_SHA}" -f "merge_method=${MERGE_METHOD}" --jq .merged 2>&1); then
+                if [ "$out" != "true" ]; then
+                  echo "::error::マージの応答を確認できませんでした: ${out}"
+                  exit 1
+                fi
+              else
+                # マージが拒否されたと確定できる応答（405 マージできない・409 shaが違う・422 検証エラー）のときだけ、
+                # このリクエストはマージしていないと言える。直前に別の操作でマージされたときも405になる。
+                # タイムアウト・5xx・応答なしは結果が分からない（GitHub側でマージが完了している場合がある）ので、
+                # マージ済みに見えても「別の操作」とは決めつけず、失敗にして、デプロイの確認を求める。
+                if grep -qE "HTTP (405|409|422)" <<< "$out"; then
+                  state=$(gh pr view "$PR_URL" --json state --jq .state)
+                  if [ "$state" != "OPEN" ]; then
+                    echo "merged=false" >> "$GITHUB_OUTPUT"
+                    echo "### このPRは別の操作で ${state} になったため、何もしませんでした" >> "$GITHUB_STEP_SUMMARY"
+                    exit 0
+                  fi
+                  echo "::error::マージが拒否されました: ${out}"
+                  exit 1
+                fi
+                echo "::error::マージの結果を確認できませんでした: ${out}"
+                echo "### マージの結果が不明です。PRの状態を確かめ、マージ済みならデプロイが要るか確認して、必要なら手動で起動してください" >> "$GITHUB_STEP_SUMMARY"
+                exit 1
+              fi
+              # マージ後のブランチの削除。失敗してもマージは済んでいるので、警告だけにする。
+              gh api -X DELETE "repos/${REPO}/git/refs/heads/${HEAD_REF}" > /dev/null 2>&1 \
+                || echo "::warning::ブランチ ${HEAD_REF} を削除できませんでした。"
+              echo "merged=true" >> "$GITHUB_OUTPUT"
+              echo "### ${UPDATE_TYPE} のため、自動でマージしました" >> "$GITHUB_STEP_SUMMARY"
+              ;;
+            *)
+              echo "merged=false" >> "$GITHUB_OUTPUT"
+              echo "### ${UPDATE_TYPE:-種類が不明な更新} のため、自動ではマージしません。内容を確かめて手動でマージしてください" >> "$GITHUB_STEP_SUMMARY"
+              ;;
+          esac
+
+      # デプロイの出力は、マージが成功した後に確定する（今回マージした場合だけ true）。
+      - name: デプロイの要否を出力
+        id: result
+        env:
+          MERGED: ${{ steps.merge.outputs.merged }}
+          MATCH: ${{ steps.scope.outputs.match }}
+        run: |
+          set -euo pipefail
+          if [ "$MERGED" = "true" ] && [ "$MATCH" = "true" ]; then
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "deploy=false" >> "$GITHUB_OUTPUT"
+          fi
