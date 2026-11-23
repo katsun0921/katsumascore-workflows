@@ -47,7 +47,7 @@ jobs:
       pull-requests: write
     outputs:
       merged: ${{ steps.merge.outputs.merged }}
-      deploy: ${{ steps.scope.outputs.deploy }}
+      deploy: ${{ steps.result.outputs.deploy }}
     env:
       GH_TOKEN: ${{ github.token }}
       REPO: ${{ github.repository }}
@@ -66,8 +66,10 @@ jobs:
         with:
           github-token: ${{ github.token }}
 
-      - name: パッチ・マイナー更新ならマージ
-        id: merge
+      # マージの前に、デプロイが要るかを決める。正規表現の誤りや変更ファイルの取得失敗は、マージする前に失敗させる
+      # （マージだけが確定して、デプロイの判定が失敗した状態にしない）。
+      - name: デプロイが要るか判定（マージ前）
+        id: scope
         env:
           UPDATE_TYPE: ${{ steps.meta.outputs.update-type }}
         run: |
@@ -79,9 +81,58 @@ jobs:
               exit 1
               ;;
           esac
+          # マージしない更新（メジャー・不明）では、変更ファイルを調べない。
+          case "$UPDATE_TYPE" in
+            version-update:semver-patch|version-update:semver-minor) ;;
+            *)
+              echo "match=false" >> "$GITHUB_OUTPUT"
+              exit 0
+              ;;
+          esac
+          # 対象のパスの指定がなければ、マージしたら常にデプロイする。
+          if [ -z "$DEPLOY_PATHS" ]; then
+            echo "match=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # grep -E の終了コード：0＝一致あり、1＝一致なし、2以上＝正規表現の誤りなど。
+          # 空の入力で正規表現だけを検証する（誤りなら2）。
+          status=0
+          grep -qE -- "$DEPLOY_PATHS" < /dev/null || status=$?
+          if [ "$status" -gt 1 ]; then
+            echo "::error::deploy-paths の正規表現が不正です: ${DEPLOY_PATHS}"
+            exit 1
+          fi
+          files=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}/files" --paginate --jq '.[].filename')
+          printf '%s\n' "$files"
+          # ヒアストリングで渡す。パイプにすると、grep -q が先に終わったときに、書き込み側がSIGPIPEで失敗する。
+          status=0
+          grep -qE -- "$DEPLOY_PATHS" <<< "$files" || status=$?
+          case "$status" in
+            0) echo "match=true" >> "$GITHUB_OUTPUT" ;;
+            1) echo "match=false" >> "$GITHUB_OUTPUT" ;;
+            *)
+              echo "::error::deploy-paths の判定に失敗しました（終了コード ${status}）。"
+              exit 1
+              ;;
+          esac
+
+      - name: パッチ・マイナー更新ならマージ
+        id: merge
+        env:
+          UPDATE_TYPE: ${{ steps.meta.outputs.update-type }}
+        run: |
+          set -euo pipefail
           # 種類が分からない更新（空）も、メジャー更新と同じく人が確かめる。明示的にパッチ・マイナーのものだけをマージする。
           case "$UPDATE_TYPE" in
             version-update:semver-patch|version-update:semver-minor)
+              # 再実行したときのイベントは、最初の実行のときの内容のまま。いまの状態を確かめ、すでにマージ済み・閉じ済みなら、
+              # 今回のマージとして扱わない（gh pr merge は、マージ済みでも成功で返るため）。
+              state=$(gh pr view "$PR_URL" --json state --jq .state)
+              if [ "$state" != "OPEN" ]; then
+                echo "merged=false" >> "$GITHUB_OUTPUT"
+                echo "### このPRはすでに ${state} のため、何もしませんでした（デプロイが要るときは、呼び出し側のデプロイを手動で起動してください）" >> "$GITHUB_STEP_SUMMARY"
+                exit 0
+              fi
               gh pr merge "$PR_URL" "--${MERGE_METHOD}" --delete-branch --match-head-commit "$HEAD_SHA"
               echo "merged=true" >> "$GITHUB_OUTPUT"
               echo "### ${UPDATE_TYPE} のため、自動でマージしました" >> "$GITHUB_STEP_SUMMARY"
@@ -92,31 +143,16 @@ jobs:
               ;;
           esac
 
-      - name: デプロイが要るか判定
-        id: scope
+      # デプロイの出力は、マージが成功した後に確定する（今回マージした場合だけ true）。
+      - name: デプロイの要否を出力
+        id: result
         env:
           MERGED: ${{ steps.merge.outputs.merged }}
+          MATCH: ${{ steps.scope.outputs.match }}
         run: |
           set -euo pipefail
-          if [ "$MERGED" != "true" ]; then
-            echo "deploy=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          # 対象のパスの指定がなければ、マージしたら常にデプロイする。
-          if [ -z "$DEPLOY_PATHS" ]; then
+          if [ "$MERGED" = "true" ] && [ "$MATCH" = "true" ]; then
             echo "deploy=true" >> "$GITHUB_OUTPUT"
-            exit 0
+          else
+            echo "deploy=false" >> "$GITHUB_OUTPUT"
           fi
-          files=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}/files" --paginate --jq '.[].filename')
-          printf '%s\n' "$files"
-          # grep -E の終了コード：0＝一致あり、1＝一致なし、2以上＝正規表現の誤りなど。誤りは失敗にして、黙ってデプロイを飛ばさない。
-          status=0
-          printf '%s\n' "$files" | grep -qE -- "$DEPLOY_PATHS" || status=$?
-          case "$status" in
-            0) echo "deploy=true" >> "$GITHUB_OUTPUT" ;;
-            1) echo "deploy=false" >> "$GITHUB_OUTPUT" ;;
-            *)
-              echo "::error::deploy-paths の正規表現が不正です: ${DEPLOY_PATHS}"
-              exit 1
-              ;;
-          esac

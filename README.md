@@ -44,6 +44,7 @@ DependabotのPRを、試験が通った後に、パッチ・マイナー更新�
 [examples/dependabot-auto-merge-caller.yml](examples/dependabot-auto-merge-caller.yml) のジョブを、呼び出し側のPRで動く試験のworkflowに足す。
 
 - 試験のジョブの後（`needs`）に呼ぶ。呼び出し側のジョブに `permissions: contents: write`・`pull-requests: write` を付ける。
+- `deploy-paths` の検証と変更ファイルの判定は、マージする前に行う（誤りがあればマージせずに失敗する）。`deploy` は、今回このワークフローがマージしたときだけ `true` になる。再実行で、すでにマージ済みのPRを見つけたときは `false` なので、デプロイが要るときは呼び出し側のデプロイを手動で起動する。
 - マージ後にデプロイするリポジトリは、`outputs.deploy` を見て、呼び出し側のジョブでデプロイのworkflowを起動する（`actions: write` は、そのジョブにだけ付ける）。
 
 | 入力 | 既定 | 意味 |
