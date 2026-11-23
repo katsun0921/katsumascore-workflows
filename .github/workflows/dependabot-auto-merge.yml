@@ -143,14 +143,22 @@ jobs:
                   exit 1
                 fi
               else
-                # 直前に別の操作でマージされたときも、ここに来る。いまの状態を見て、マージ済みなら今回のマージとして扱わない。
-                state=$(gh pr view "$PR_URL" --json state --jq .state)
-                if [ "$state" != "OPEN" ]; then
-                  echo "merged=false" >> "$GITHUB_OUTPUT"
-                  echo "### このPRは別の操作で ${state} になったため、何もしませんでした" >> "$GITHUB_STEP_SUMMARY"
-                  exit 0
+                # マージが拒否されたと確定できる応答（405 マージできない・409 shaが違う・422 検証エラー）のときだけ、
+                # このリクエストはマージしていないと言える。直前に別の操作でマージされたときも405になる。
+                # タイムアウト・5xx・応答なしは結果が分からない（GitHub側でマージが完了している場合がある）ので、
+                # マージ済みに見えても「別の操作」とは決めつけず、失敗にして、デプロイの確認を求める。
+                if grep -qE "HTTP (405|409|422)" <<< "$out"; then
+                  state=$(gh pr view "$PR_URL" --json state --jq .state)
+                  if [ "$state" != "OPEN" ]; then
+                    echo "merged=false" >> "$GITHUB_OUTPUT"
+                    echo "### このPRは別の操作で ${state} になったため、何もしませんでした" >> "$GITHUB_STEP_SUMMARY"
+                    exit 0
+                  fi
+                  echo "::error::マージが拒否されました: ${out}"
+                  exit 1
                 fi
-                echo "::error::マージに失敗しました: ${out}"
+                echo "::error::マージの結果を確認できませんでした: ${out}"
+                echo "### マージの結果が不明です。PRの状態を確かめ、マージ済みならデプロイが要るか確認して、必要なら手動で起動してください" >> "$GITHUB_STEP_SUMMARY"
                 exit 1
               fi
               # マージ後のブランチの削除。失敗してもマージは済んでいるので、警告だけにする。
