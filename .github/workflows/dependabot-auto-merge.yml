@@ -55,6 +55,7 @@ jobs:
       PR_NUMBER: ${{ github.event.pull_request.number }}
       # 試験した後に別のコミットが積まれていたら、マージしない（試験していないコードを入れない）。
       HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      HEAD_REF: ${{ github.event.pull_request.head.ref }}
       MERGE_METHOD: ${{ inputs.merge-method }}
       DEPLOY_PATHS: ${{ inputs.deploy-paths }}
     steps:
@@ -133,7 +134,28 @@ jobs:
                 echo "### このPRはすでに ${state} のため、何もしませんでした（デプロイが要るときは、呼び出し側のデプロイを手動で起動してください）" >> "$GITHUB_STEP_SUMMARY"
                 exit 0
               fi
-              gh pr merge "$PR_URL" "--${MERGE_METHOD}" --delete-branch --match-head-commit "$HEAD_SHA"
+              # マージは REST API で行い、応答の merged で、今回このリクエストがマージしたかを確かめる
+              # （gh pr merge は、直前に別の操作でマージされていても成功で返るため、今回の操作と区別できない）。
+              # sha を渡すので、試験した後に別のコミットが積まれていたら409で失敗する（--match-head-commit と同じ）。
+              if out=$(gh api -X PUT "repos/${REPO}/pulls/${PR_NUMBER}/merge" -f "sha=${HEAD_SHA}" -f "merge_method=${MERGE_METHOD}" --jq .merged 2>&1); then
+                if [ "$out" != "true" ]; then
+                  echo "::error::マージの応答を確認できませんでした: ${out}"
+                  exit 1
+                fi
+              else
+                # 直前に別の操作でマージされたときも、ここに来る。いまの状態を見て、マージ済みなら今回のマージとして扱わない。
+                state=$(gh pr view "$PR_URL" --json state --jq .state)
+                if [ "$state" != "OPEN" ]; then
+                  echo "merged=false" >> "$GITHUB_OUTPUT"
+                  echo "### このPRは別の操作で ${state} になったため、何もしませんでした" >> "$GITHUB_STEP_SUMMARY"
+                  exit 0
+                fi
+                echo "::error::マージに失敗しました: ${out}"
+                exit 1
+              fi
+              # マージ後のブランチの削除。失敗してもマージは済んでいるので、警告だけにする。
+              gh api -X DELETE "repos/${REPO}/git/refs/heads/${HEAD_REF}" > /dev/null 2>&1 \
+                || echo "::warning::ブランチ ${HEAD_REF} を削除できませんでした。"
               echo "merged=true" >> "$GITHUB_OUTPUT"
               echo "### ${UPDATE_TYPE} のため、自動でマージしました" >> "$GITHUB_STEP_SUMMARY"
               ;;
