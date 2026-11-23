@@ -1,0 +1,31 @@
+# 呼び出し側のリポジトリの、PRで動く試験のworkflowに足すジョブの例。
+# <SHA> は katsun0921/katsumascore-workflows の、使うコミットの40桁のSHAに置き換える（タグやブランチ名にしない）。
+#
+# 例：既存の ci.yml（on: pull_request、試験のジョブ名が test）に、下の jobs を足す。
+
+jobs:
+  # test: ...（既存の試験のジョブ）
+
+  auto-merge:
+    # 試験が通ったときだけ呼ぶ。DependabotのPRかどうかは、共通ワークフロー側で判定する。
+    needs: test
+    # マージとブランチの削除に要る権限の上限。
+    permissions:
+      contents: write
+      pull-requests: write
+    uses: katsun0921/katsumascore-workflows/.github/workflows/dependabot-auto-merge.yml@<SHA>
+    # マージ後にデプロイするリポジトリだけ指定する（例：vod_bot か utils の変更のときだけデプロイ）。省略すれば、マージしたら常に outputs.deploy が true。
+    # with:
+    #   deploy-paths: '^(vod_bot|utils)/'
+
+  # マージ後にデプロイするリポジトリだけ足す。GITHUB_TOKENのマージでは main への push のworkflowが起動しないため、明示的に起動する。
+  deploy:
+    needs: auto-merge
+    if: needs.auto-merge.outputs.deploy == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: write
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run deploy.yml --ref main --repo "$GITHUB_REPOSITORY"

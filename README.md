@@ -35,6 +35,34 @@ PRが対象のブランチにマージされたら、次の版のタグ（`vMAJO
   - その古いPRに`minor-label`・`major-label`があったときは、桁上げが失われるので実行を失敗にする。必要なら手動で版を作る。
   - 最新の版と対象のコミットの履歴が分かれている（ブランチの書き換えなど）ときは、失敗にする。
 
+## dependabot-auto-merge（`.github/workflows/dependabot-auto-merge.yml`）
+
+DependabotのPRを、試験が通った後に、パッチ・マイナー更新なら自動でマージする。
+
+### 使い方
+
+[examples/dependabot-auto-merge-caller.yml](examples/dependabot-auto-merge-caller.yml) のジョブを、呼び出し側のPRで動く試験のworkflowに足す。
+
+- 試験のジョブの後（`needs`）に呼ぶ。呼び出し側のジョブに `permissions: contents: write`・`pull-requests: write` を付ける。
+- マージ後にデプロイするリポジトリは、`outputs.deploy` を見て、呼び出し側のジョブでデプロイのworkflowを起動する（`actions: write` は、そのジョブにだけ付ける）。
+
+| 入力 | 既定 | 意味 |
+|---|---|---|
+| `merge-method` | `merge` | マージの方法（`merge`・`squash`・`rebase`） |
+| `deploy-paths` | 空 | デプロイが要る変更ファイルのパス（`grep -E`の正規表現）。空なら、マージしたら常に `deploy` が `true` |
+
+| 出力 | 意味 |
+|---|---|
+| `merged` | マージしたら `'true'` |
+| `deploy` | マージし、かつ `deploy-paths` に当たる変更を含むなら `'true'` |
+
+### 動き
+
+- `update-type` が `version-update:semver-patch`・`version-update:semver-minor` のときだけマージする。メジャー更新と、種類が分からない更新はマージしない（人が確かめる）。
+- 試験の後に別のコミットが積まれていたら、マージしない（`--match-head-commit`）。
+- コミットがDependabotのものかは `dependabot/fetch-metadata` が確かめる。
+- **GITHUB_TOKENでのマージは、別のworkflowを起動しない。** mainへのpushで動くデプロイや、release-tagは、自動マージでは動かない。デプロイは上のとおり呼び出し側で起動する。版のタグは、次に人がマージしたときの版に含まれる。
+
 ## 開発
 
 ```bash

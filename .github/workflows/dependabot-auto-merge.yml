@@ -1,0 +1,122 @@
+# 再利用可能ワークフロー：DependabotのPRを、パッチ・マイナー更新なら自動でマージする。メジャー更新はマージしない。
+# 呼び出し方は README.md と examples/dependabot-auto-merge-caller.yml を参照する。
+#
+# 呼び出し側は、試験のジョブの後（needs）にこのワークフローを呼ぶ。試験が通ったPRだけがマージされる。
+# マージ後のデプロイの起動は、呼び出し側が行う（必要な actions: write を、デプロイしないリポジトリに渡さないため）。
+# このワークフローは、デプロイが要るかどうかを outputs.deploy で返す。
+#
+# 注意：GITHUB_TOKENでのマージは、push・pull_request_target などの別のworkflowを起動しない。
+# mainへのpushで動くデプロイや release-tag.yml は、自動マージでは動かない。
+name: dependabot-auto-merge
+
+on:
+  workflow_call:
+    inputs:
+      merge-method:
+        description: マージの方法（merge・squash・rebase）。
+        type: string
+        default: merge
+      deploy-paths:
+        description: >-
+          デプロイが要る変更ファイルのパス（grep -E の正規表現。例：'^(vod_bot|utils)/'）。
+          空なら、マージしたら常に outputs.deploy を true にする。
+        type: string
+        default: ''
+    outputs:
+      merged:
+        description: このPRをマージしたら 'true'。
+        value: ${{ jobs.merge.outputs.merged }}
+      deploy:
+        description: マージし、かつ deploy-paths に当たる変更を含むなら 'true'。
+        value: ${{ jobs.merge.outputs.deploy }}
+
+permissions:
+  contents: read
+
+jobs:
+  merge:
+    # DependabotのPRのときだけ動く（pushなど、PR以外のイベントでも呼ばれうるため、イベント名も見る）。
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.user.login == 'dependabot[bot]'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    # 呼び出し側の上限を超えない。マージとブランチの削除に、この2つが要る。
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      merged: ${{ steps.merge.outputs.merged }}
+      deploy: ${{ steps.scope.outputs.deploy }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      PR_URL: ${{ github.event.pull_request.html_url }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      # 試験した後に別のコミットが積まれていたら、マージしない（試験していないコードを入れない）。
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      MERGE_METHOD: ${{ inputs.merge-method }}
+      DEPLOY_PATHS: ${{ inputs.deploy-paths }}
+    steps:
+      # タグの付け替えで実行内容が変わらないよう、ActionをコミットSHAで固定する。
+      # コミットがDependabotのものかも、このActionが確かめる（偽装したPRでは失敗する）。
+      - name: Dependabot のメタデータを取得
+        id: meta
+        uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
+        with:
+          github-token: ${{ github.token }}
+
+      - name: パッチ・マイナー更新ならマージ
+        id: merge
+        env:
+          UPDATE_TYPE: ${{ steps.meta.outputs.update-type }}
+        run: |
+          set -euo pipefail
+          case "$MERGE_METHOD" in
+            merge|squash|rebase) ;;
+            *)
+              echo "::error::merge-method は merge・squash・rebase のどれかにしてください（いま：${MERGE_METHOD}）。"
+              exit 1
+              ;;
+          esac
+          # 種類が分からない更新（空）も、メジャー更新と同じく人が確かめる。明示的にパッチ・マイナーのものだけをマージする。
+          case "$UPDATE_TYPE" in
+            version-update:semver-patch|version-update:semver-minor)
+              gh pr merge "$PR_URL" "--${MERGE_METHOD}" --delete-branch --match-head-commit "$HEAD_SHA"
+              echo "merged=true" >> "$GITHUB_OUTPUT"
+              echo "### ${UPDATE_TYPE} のため、自動でマージしました" >> "$GITHUB_STEP_SUMMARY"
+              ;;
+            *)
+              echo "merged=false" >> "$GITHUB_OUTPUT"
+              echo "### ${UPDATE_TYPE:-種類が不明な更新} のため、自動ではマージしません。内容を確かめて手動でマージしてください" >> "$GITHUB_STEP_SUMMARY"
+              ;;
+          esac
+
+      - name: デプロイが要るか判定
+        id: scope
+        env:
+          MERGED: ${{ steps.merge.outputs.merged }}
+        run: |
+          set -euo pipefail
+          if [ "$MERGED" != "true" ]; then
+            echo "deploy=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # 対象のパスの指定がなければ、マージしたら常にデプロイする。
+          if [ -z "$DEPLOY_PATHS" ]; then
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          files=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}/files" --paginate --jq '.[].filename')
+          printf '%s\n' "$files"
+          # grep -E の終了コード：0＝一致あり、1＝一致なし、2以上＝正規表現の誤りなど。誤りは失敗にして、黙ってデプロイを飛ばさない。
+          status=0
+          printf '%s\n' "$files" | grep -qE -- "$DEPLOY_PATHS" || status=$?
+          case "$status" in
+            0) echo "deploy=true" >> "$GITHUB_OUTPUT" ;;
+            1) echo "deploy=false" >> "$GITHUB_OUTPUT" ;;
+            *)
+              echo "::error::deploy-paths の正規表現が不正です: ${DEPLOY_PATHS}"
+              exit 1
+              ;;
+          esac
