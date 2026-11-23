@@ -155,12 +155,25 @@ jobs:
           }
 
           # 公開済みの最新のReleaseより古い版を補うときは、Latestを巻き戻さない。
+          # 最新のReleaseがない（404）ときは何もしない。それ以外の失敗（一時障害など）は、公開する前に止める。
+          # 結果は latest_args に入れる（Releaseを作る直前に呼ぶ）。
           latest_args=()
-          latest=$(gh api "repos/${REPO}/releases/latest" --jq .tag_name 2>/dev/null || true)
-          if [[ "$latest" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] && [ "$latest" != "$VERSION" ] \
-            && [ "$(printf '%s\n%s\n' "$latest" "$VERSION" | sort -V | tail -n 1)" = "$latest" ]; then
-            latest_args=(--latest=false)
-          fi
+          set_latest_args() {
+            local out latest
+            latest_args=()
+            if out=$(gh api "repos/${REPO}/releases/latest" --jq .tag_name 2>&1); then
+              latest=$out
+            elif grep -q "HTTP 404" <<< "$out"; then
+              latest=""
+            else
+              echo "::error::最新のReleaseを取得できませんでした。Latestを巻き戻さないため、Releaseは作りません: ${out}"
+              exit 1
+            fi
+            if [[ "$latest" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] && [ "$latest" != "$VERSION" ] \
+              && [ "$(printf '%s\n%s\n' "$latest" "$VERSION" | sort -V | tail -n 1)" = "$latest" ]; then
+              latest_args=(--latest=false)
+            fi
+          }
 
           case "$ACTION" in
             create)
@@ -172,6 +185,7 @@ jobs:
               if release_published; then
                 result="すでにあるため、何もしませんでした"
               else
+                set_latest_args
                 gh release create "$VERSION" --verify-tag ${latest_args[@]+"${latest_args[@]}"} "${args[@]}"
                 result="版のタグとリリースを作りました"
               fi
@@ -183,6 +197,7 @@ jobs:
                 echo "このコミットには、すでに${VERSION}のタグとリリースがあります。何もしません。"
                 result="すでにあるため、何もしませんでした"
               else
+                set_latest_args
                 gh release create "$VERSION" --verify-tag ${latest_args[@]+"${latest_args[@]}"} "${args[@]}"
                 result="既存のタグにリリースを作りました"
               fi
