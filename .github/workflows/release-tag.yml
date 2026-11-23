@@ -66,10 +66,12 @@ jobs:
       RELEASE_FIRST_VERSION: ${{ inputs.first-version }}
     steps:
       # タグの付け替えで実行内容が変わらないよう、ActionをコミットSHAで固定する。
-      # 呼び出し側のリポジトリは、マージ後のコミットを取得する。タグの前後関係を見るため、全履歴とタグを取る。
+      # 呼び出し側のリポジトリは、対象ブランチの履歴を取得する。タグの前後関係を見るため、全履歴とタグを取る。
+      # merge_commit_sha を ref に明示すると、checkout は pull_request_target のfork PRを（マージ済みでも）拒否する。
+      # そのため ref は対象ブランチにし、マージ結果のコミットは、祖先の確認とタグ付けの対象（MERGE_SHA）としてだけ使う。
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event.pull_request.merge_commit_sha }}
+          ref: refs/heads/${{ inputs.branch }}
           fetch-depth: 0
           persist-credentials: false
           path: target
@@ -112,18 +114,76 @@ jobs:
           if [ -n "$PREVIOUS" ]; then
             args+=(--notes-start-tag "$PREVIOUS")
           fi
+
+          # タグが指すコミットを返す（注釈付きタグも、指す先のコミットまでたどる）。タグがなければ何も出さない。
+          tag_commit() {
+            local obj type sha
+            obj=$(gh api "repos/${REPO}/git/ref/tags/${VERSION}" --jq '[.object.type, .object.sha] | @tsv' 2>/dev/null) || return 0
+            type=${obj%%$'\t'*}
+            sha=${obj##*$'\t'}
+            while [ "$type" = "tag" ]; do
+              obj=$(gh api "repos/${REPO}/git/tags/${sha}" --jq '[.object.type, .object.sha] | @tsv')
+              type=${obj%%$'\t'*}
+              sha=${obj##*$'\t'}
+            done
+            echo "$sha"
+          }
+
+          # タグが対象のコミットを指していることを確かめる。別のコミットを指していたら、Releaseを作らずに止める。
+          # Releaseの作成APIは、タグがすでにあると --target を無視して、そのタグのコミットで作るため。
+          assert_tag_at_target() {
+            local at
+            at=$(tag_commit)
+            if [ "$at" != "$MERGE_SHA" ]; then
+              echo "::error::タグ${VERSION}は${at:-（なし）}を指しており、対象のコミット${MERGE_SHA}と違います。Releaseは作りません。"
+              exit 1
+            fi
+          }
+
+          # 同名のReleaseがすでにあるか確かめる。下書きは利用者に公開されないので、成功扱いにせず止める。
+          # 戻り値：0 公開済みのReleaseがある／1 ない。下書きのときはこの関数の中で止める。
+          release_published() {
+            local draft
+            if ! draft=$(gh release view "$VERSION" --repo "$REPO" --json isDraft --jq .isDraft 2>/dev/null); then
+              return 1
+            fi
+            if [ "$draft" = "true" ]; then
+              echo "::error::${VERSION}のReleaseは下書きのままで、公開されていません。下書きを公開するか削除してから、再実行してください。"
+              exit 1
+            fi
+            return 0
+          }
+
+          # 公開済みの最新のReleaseより古い版を補うときは、Latestを巻き戻さない。
+          latest_args=()
+          latest=$(gh api "repos/${REPO}/releases/latest" --jq .tag_name 2>/dev/null || true)
+          if [[ "$latest" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] && [ "$latest" != "$VERSION" ] \
+            && [ "$(printf '%s\n%s\n' "$latest" "$VERSION" | sort -V | tail -n 1)" = "$latest" ]; then
+            latest_args=(--latest=false)
+          fi
+
           case "$ACTION" in
             create)
-              gh release create "$VERSION" --target "$MERGE_SHA" "${args[@]}"
-              result="版のタグとリリースを作りました"
+              # 先にタグを、上書きなしで作る。同名のタグが先にできていたら422になるので、指す先を確かめる。
+              if ! gh api "repos/${REPO}/git/refs" -f "ref=refs/tags/${VERSION}" -f "sha=${MERGE_SHA}" > /dev/null; then
+                assert_tag_at_target
+                echo "タグ${VERSION}はすでに対象のコミットにあります。"
+              fi
+              if release_published; then
+                result="すでにあるため、何もしませんでした"
+              else
+                gh release create "$VERSION" --verify-tag ${latest_args[@]+"${latest_args[@]}"} "${args[@]}"
+                result="版のタグとリリースを作りました"
+              fi
               ;;
             existing)
               # 正式な版のタグだけがあり、Releaseがない（前回の実行がタグの作成後に失敗した）ときは、そのタグでReleaseを作る。
-              if gh release view "$VERSION" --repo "$REPO" > /dev/null 2>&1; then
+              assert_tag_at_target
+              if release_published; then
                 echo "このコミットには、すでに${VERSION}のタグとリリースがあります。何もしません。"
                 result="すでにあるため、何もしませんでした"
               else
-                gh release create "$VERSION" --verify-tag "${args[@]}"
+                gh release create "$VERSION" --verify-tag ${latest_args[@]+"${latest_args[@]}"} "${args[@]}"
                 result="既存のタグにリリースを作りました"
               fi
               ;;
