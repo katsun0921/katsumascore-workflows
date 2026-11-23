@@ -1,0 +1,23 @@
+[project]
+name = "katsumascore-workflows"
+version = "0.0.0"
+description = "KatsumaScoreの各リポジトリで共通に使う、GitHub Actionsの再利用可能ワークフロー"
+requires-python = ">=3.12"
+dependencies = []
+
+[dependency-groups]
+# 実行時（ワークフロー内）は標準ライブラリだけを使う。試験と型チェックのためだけに入れる。
+dev = ["pytest==9.2.0", "mypy==2.4.1"]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "--strict-markers"
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["scripts", "tests"]

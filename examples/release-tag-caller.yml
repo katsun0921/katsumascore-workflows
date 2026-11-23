@@ -1,0 +1,24 @@
+# 呼び出し側のリポジトリに .github/workflows/release-tag.yml として置く例。
+# <SHA> は katsun0921/katsumascore-workflows の、使うコミットの40桁のSHAに置き換える（タグやブランチ名にしない）。
+name: release-tag
+
+# forkやDependabotのPRでも書き込めるよう、pull_request ではなく pull_request_target で起動する。
+# 共通ワークフローは呼び出し側のコードを実行しないので、pull_request_target でもPRのコードは動かない。
+on:
+  pull_request_target:
+    types: [closed]
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    # 共通ワークフローに渡す権限の上限。タグとReleaseの作成に contents: write が要る。
+    permissions:
+      contents: write
+    # concurrency はここに付けない（共通ワークフローのジョブが持つ。同じグループを付けると待ち合う）。
+    uses: katsun0921/katsumascore-workflows/.github/workflows/release-tag.yml@<SHA>
+    # 既定と同じなら with は省略できる。
+    with:
+      branch: main

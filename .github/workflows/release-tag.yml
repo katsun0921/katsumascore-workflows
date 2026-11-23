@@ -1,0 +1,218 @@
+# 再利用可能ワークフロー：PRが対象のブランチにマージされたら、次の版のタグ（vMAJOR.MINOR.PATCH）とGitHub Releaseを作る。
+# 呼び出し方は README.md と examples/release-tag-caller.yml を参照する。
+#
+# 版の上げ方：既定はパッチ（v1.0.0 → v1.0.1）。PRに major-label で1桁目、minor-label で2桁目を上げる（両方あれば1桁目）。
+# ラベルは、マージする前に付ける（マージ後に付けても、すでに打ったタグは変わらない）。
+# タグは軽量タグで、PRのマージ結果のコミットに打つ。リリースノートは、前の版からのPRの一覧を自動で作る。
+# 判定は scripts/release_version.py（tests/test_release_version.py で試験）。秘密値は使わず、GITHUB_TOKENだけで動く。
+#
+# 書き込み権限のあるこのジョブでは、呼び出し側のリポジトリのコードを一切実行しない。
+# 実行するのは、このワークフローと同じコミット（job.workflow_sha）の scripts/release_version.py だけ。
+name: release-tag
+
+on:
+  workflow_call:
+    inputs:
+      branch:
+        description: 版を打つ対象のブランチ。呼び出し側の on.pull_request_target.branches と同じにする。
+        type: string
+        default: main
+      major-label:
+        description: 1桁目を上げるPRのラベル名。
+        type: string
+        default: major
+      minor-label:
+        description: 2桁目を上げるPRのラベル名。
+        type: string
+        default: minor
+      first-version:
+        description: 正式な版のタグがまだないときの最初の版。
+        type: string
+        default: v1.0.0
+
+permissions:
+  contents: read
+
+jobs:
+  tag:
+    # マージされずに閉じられたPR、対象外のブランチへのPRでは動かさない（ジョブは飛ばされ、待ち行列にも入らない）。
+    if: >-
+      github.event.pull_request.merged == true &&
+      github.event.pull_request.base.ref == inputs.branch
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    # 呼び出し側の上限（contents: write）を超えない。呼び出し側がreadしか渡さなければ、作成の手順で失敗する。
+    permissions:
+      contents: write
+    # 版の判定は、リポジトリごとに同時に1つだけ。既定（queue: single）では待機は1件だけで、
+    # 続けてマージすると先に待っていた実行が取り消されるため、max（最大100件）にする。
+    # 呼び出し側のジョブに同じグループを付けると、呼び出し側が枠を持ったまま待ち合うので、呼び出し側には付けない。
+    # 待ち行列の順序はマージ順と限らない。順序が逆転したときの扱いは scripts/release_version.py が決める。
+    concurrency:
+      group: release-tag
+      cancel-in-progress: false
+      queue: max
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      BRANCH: ${{ inputs.branch }}
+      EVENT_NAME: ${{ github.event_name }}
+      MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      # 入力値とラベルは環境変数で渡し、シェルの文字列に直接埋め込まない。
+      RELEASE_LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+      RELEASE_MAJOR_LABEL: ${{ inputs.major-label }}
+      RELEASE_MINOR_LABEL: ${{ inputs.minor-label }}
+      RELEASE_FIRST_VERSION: ${{ inputs.first-version }}
+    steps:
+      # タグの付け替えで実行内容が変わらないよう、ActionをコミットSHAで固定する。
+      # 呼び出し側のリポジトリは、対象ブランチの履歴を取得する。タグの前後関係を見るため、全履歴とタグを取る。
+      # merge_commit_sha を ref に明示すると、checkout は pull_request_target のfork PRを（マージ済みでも）拒否する。
+      # そのため ref は対象ブランチにし、マージ結果のコミットは、祖先の確認とタグ付けの対象（MERGE_SHA）としてだけ使う。
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/heads/${{ inputs.branch }}
+          fetch-depth: 0
+          persist-credentials: false
+          path: target
+
+      # 判定のスクリプトは、呼び出し側が固定したのと同じコミットのものを使う（呼び出し側のコードは使わない）。
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: katsun0921/katsumascore-workflows
+          ref: ${{ job.workflow_sha }}
+          persist-credentials: false
+          path: release-tools
+
+      - name: 行う操作を決める
+        id: version
+        working-directory: target
+        run: |
+          set -euo pipefail
+          # forkのPRでも書き込めるのは pull_request_target だけ。pull_request で呼ばれたら、権限不足で途中まで進む前に止める。
+          if [ "$EVENT_NAME" != "pull_request_target" ]; then
+            echo "::error::呼び出し側は on.pull_request_target（types: [closed]）で起動してください（いま：${EVENT_NAME}）。"
+            exit 1
+          fi
+          # 対象のブランチに入っていないコミットには版を打たない。
+          if ! git merge-base --is-ancestor "$MERGE_SHA" "origin/${BRANCH}"; then
+            echo "::error::マージ結果のコミット（${MERGE_SHA}）が${BRANCH}にありません。"
+            exit 1
+          fi
+          # -I：呼び出し側のリポジトリ（カレントディレクトリ）のPythonファイルを読み込まない。
+          python3 -I "${GITHUB_WORKSPACE}/release-tools/scripts/release_version.py" | tee -a "$GITHUB_OUTPUT"
+
+      - name: タグとリリースを作る
+        env:
+          ACTION: ${{ steps.version.outputs.action }}
+          VERSION: ${{ steps.version.outputs.version }}
+          PREVIOUS: ${{ steps.version.outputs.previous }}
+        run: |
+          set -euo pipefail
+          args=(--repo "$REPO" --title "$VERSION" --generate-notes)
+          # 前の版があれば、そこからのPRの一覧をリリースノートにする。
+          if [ -n "$PREVIOUS" ]; then
+            args+=(--notes-start-tag "$PREVIOUS")
+          fi
+
+          # タグが指すコミットを返す（注釈付きタグも、指す先のコミットまでたどる）。タグがなければ何も出さない。
+          tag_commit() {
+            local obj type sha
+            obj=$(gh api "repos/${REPO}/git/ref/tags/${VERSION}" --jq '[.object.type, .object.sha] | @tsv' 2>/dev/null) || return 0
+            type=${obj%%$'\t'*}
+            sha=${obj##*$'\t'}
+            while [ "$type" = "tag" ]; do
+              obj=$(gh api "repos/${REPO}/git/tags/${sha}" --jq '[.object.type, .object.sha] | @tsv')
+              type=${obj%%$'\t'*}
+              sha=${obj##*$'\t'}
+            done
+            echo "$sha"
+          }
+
+          # タグが対象のコミットを指していることを確かめる。別のコミットを指していたら、Releaseを作らずに止める。
+          # Releaseの作成APIは、タグがすでにあると --target を無視して、そのタグのコミットで作るため。
+          assert_tag_at_target() {
+            local at
+            at=$(tag_commit)
+            if [ "$at" != "$MERGE_SHA" ]; then
+              echo "::error::タグ${VERSION}は${at:-（なし）}を指しており、対象のコミット${MERGE_SHA}と違います。Releaseは作りません。"
+              exit 1
+            fi
+          }
+
+          # 同名のReleaseがすでにあるか確かめる。下書きは利用者に公開されないので、成功扱いにせず止める。
+          # 戻り値：0 公開済みのReleaseがある／1 ない。下書きのときはこの関数の中で止める。
+          release_published() {
+            local draft
+            if ! draft=$(gh release view "$VERSION" --repo "$REPO" --json isDraft --jq .isDraft 2>/dev/null); then
+              return 1
+            fi
+            if [ "$draft" = "true" ]; then
+              echo "::error::${VERSION}のReleaseは下書きのままで、公開されていません。下書きを公開するか削除してから、再実行してください。"
+              exit 1
+            fi
+            return 0
+          }
+
+          # 公開済みの最新のReleaseより古い版を補うときは、Latestを巻き戻さない。
+          # 最新のReleaseがない（404）ときは何もしない。それ以外の失敗（一時障害など）は、公開する前に止める。
+          # 結果は latest_args に入れる（Releaseを作る直前に呼ぶ）。
+          latest_args=()
+          set_latest_args() {
+            local out latest
+            latest_args=()
+            if out=$(gh api "repos/${REPO}/releases/latest" --jq .tag_name 2>&1); then
+              latest=$out
+            elif grep -q "HTTP 404" <<< "$out"; then
+              latest=""
+            else
+              echo "::error::最新のReleaseを取得できませんでした。Latestを巻き戻さないため、Releaseは作りません: ${out}"
+              exit 1
+            fi
+            if [[ "$latest" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] && [ "$latest" != "$VERSION" ] \
+              && [ "$(printf '%s\n%s\n' "$latest" "$VERSION" | sort -V | tail -n 1)" = "$latest" ]; then
+              latest_args=(--latest=false)
+            fi
+          }
+
+          case "$ACTION" in
+            create)
+              # 先にタグを、上書きなしで作る。同名のタグが先にできていたら422になるので、指す先を確かめる。
+              if ! gh api "repos/${REPO}/git/refs" -f "ref=refs/tags/${VERSION}" -f "sha=${MERGE_SHA}" > /dev/null; then
+                assert_tag_at_target
+                echo "タグ${VERSION}はすでに対象のコミットにあります。"
+              fi
+              if release_published; then
+                result="すでにあるため、何もしませんでした"
+              else
+                set_latest_args
+                gh release create "$VERSION" --verify-tag ${latest_args[@]+"${latest_args[@]}"} "${args[@]}"
+                result="版のタグとリリースを作りました"
+              fi
+              ;;
+            existing)
+              # 正式な版のタグだけがあり、Releaseがない（前回の実行がタグの作成後に失敗した）ときは、そのタグでReleaseを作る。
+              assert_tag_at_target
+              if release_published; then
+                echo "このコミットには、すでに${VERSION}のタグとリリースがあります。何もしません。"
+                result="すでにあるため、何もしませんでした"
+              else
+                set_latest_args
+                gh release create "$VERSION" --verify-tag ${latest_args[@]+"${latest_args[@]}"} "${args[@]}"
+                result="既存のタグにリリースを作りました"
+              fi
+              ;;
+            contained)
+              result="すでに${VERSION}に含まれるため、何もしませんでした"
+              ;;
+            *)
+              echo "::error::想定外の操作です: ${ACTION}"
+              exit 1
+              ;;
+          esac
+          {
+            echo "### ${result}"
+            echo "- 版：\`${VERSION}\`（前の版：\`${PREVIOUS:-なし}\`）"
+            echo "- PR：#${PR_NUMBER}"
+            echo "- コミット：\`${MERGE_SHA}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
